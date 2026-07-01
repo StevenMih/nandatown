@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+# Sealed-bid auction with Capsule selective-disclosure privacy.
+#
+# Combines a sealed-bid auction with the capsule_selective_disclosure plugin.
+# Where the default `noop` plugin leaves every bid readable on the wire and
+# `hybrid_x25519` uses Merkle authentication paths, this scenario wires the
+# capsule_selective_disclosure plugin — an SD-JWT salted-hash commitment scheme
+# per draft-mih-scitt-agent-action-capsule-sel-disc.
+#
+# Each bid is encrypted with X25519+ChaCha20-Poly1305 so only the auctioneer
+# can see the amount.  Selective-disclosure proofs (commit_credential / prove /
+# verify_proof) let a bidder reveal a subset of bid fields (e.g. the result
+# of a constraint check) without disclosing the full bid — bids stay sealed
+# on the wire, not just in the auction logic.
+#
+# Decoy digests in the _sd commitment array additionally hide the count of
+# committed fields from a passive observer of the trace.
+name: sealed_bid_capsule_privacy
+description: "1 auctioneer and 7 bidders; bids sealed via the capsule_selective_disclosure privacy layer (SD-JWT salted-hash commitments per AAC sel-disc I-D)."
+
+tier: 1
+seed: 42
+
+agents:
+  count: 8
+  brain: state-machine
+  roles:
+    - name: auctioneer
+      count: 1
+    - name: bidder
+      count: 7
+
+layers:
+  transport: in_memory
+  comms: nest_native
+  identity: did_key
+  registry: in_memory
+  auth: jwt
+  trust: score_average
+  payments: prepaid_credits
+  coordination: contract_net
+  negotiation: alternating_offers
+  memory: blackboard
+  privacy: capsule_selective_disclosure
+  datafacts: datafacts_v1
+
+task:
+  type: auction
+  config:
+    rounds: 3
+
+failures:
+  message_drop: 0.0
+
+duration: "ticks: 10000"
+
+metrics:
+  - success_rate
+  - message_count
+  - agent_count
+
+output:
+  trace: ./traces/sealed_bid_capsule_privacy.jsonl
