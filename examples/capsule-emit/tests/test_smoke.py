@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Smoke tests: instantiate both plugins and exercise one happy path each."""
+"""Smoke tests: instantiate both plugins and exercise one happy path each.
+
+CapsuleEmitTrust depends on nest_plugins_reference.trust.agent_receipts which
+is not shipped in the published nest-plugins-reference package (v0.1.1); it
+lives only in a nandatown source checkout.  The trust test therefore skips
+gracefully in a bare pip-install environment while the payments test always
+runs.
+"""
 
 import os
 
@@ -19,7 +26,11 @@ def no_real_stripe(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_trust_report_and_score(tmp_path):
-    plugin = CapsuleEmitTrust(ledger=tmp_path / "ledger.jsonl")
+    try:
+        plugin = CapsuleEmitTrust(ledger=tmp_path / "ledger.jsonl")
+    except ImportError as exc:
+        pytest.skip(f"trust backend not available: {exc}")
+
     agent = AgentId("agent-a")
     reporter = AgentId("agent-b")
 

@@ -141,7 +141,7 @@ def _real_stripe_pay(payer: AgentId, payee: AgentId, amount: float, currency: st
         )
     stripe.api_key = _STRIPE_KEY
     intent = stripe.PaymentIntent.create(
-        amount=round(amount * 100),
+        amount=round(amount * 100),  # round() avoids int() truncation ($19.99→1998¢); use Decimal for production
         currency=currency,
         confirm=True,
         automatic_payment_methods={"enabled": True, "allow_redirects": "never"},

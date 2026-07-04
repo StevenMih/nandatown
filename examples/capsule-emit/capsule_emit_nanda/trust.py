@@ -37,6 +37,11 @@ import capsule_emit
 from nest_core.types import AgentId, Attestation, Claim, Evidence, ReputationScore
 
 # Private helpers from nest-plugins-reference — couples to NANDA internals.
+# agent_receipts is not present in the published nest-plugins-reference package
+# (v0.1.1); it lives only in a source checkout of the nandatown repo.  We
+# defer the error to instantiation so that importing this module (and the
+# StripeCapsuledPayments sibling) still works in a bare pip install.
+_TRUST_BACKEND_AVAILABLE = True
 try:
     from nest_plugins_reference.trust.agent_receipts import (
         NORMALIZATION_K,
@@ -50,11 +55,8 @@ try:
         did_for_pubkey,
         is_corroborated,
     )
-except ImportError as _exc:
-    raise ImportError(
-        "capsule-emit-nanda requires nest-plugins-reference; "
-        "run: pip install -e examples/capsule-emit"
-    ) from _exc
+except ImportError:
+    _TRUST_BACKEND_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,12 @@ class CapsuleEmitTrust:
         anchor: bool = False,
         ledger: str | Path = "capsule_ledger.jsonl",
     ) -> None:
+        if not _TRUST_BACKEND_AVAILABLE:
+            raise ImportError(
+                "CapsuleEmitTrust requires nest_plugins_reference.trust.agent_receipts, "
+                "which is not present in the published nest-plugins-reference package. "
+                "Install from a source checkout of nandatown that includes the trust backend."
+            )
         self._identity = identity
         self._anchor = anchor
         self._ledger_path = Path(ledger)
