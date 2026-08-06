@@ -383,7 +383,7 @@ Issues and pull requests are welcome at
 ```bibtex
 @software{nest2026,
   title  = {Nanda Town},
-  author = {MIT Media Lab},
+  author = {Project NANDA},
   year   = {2026},
   url    = {https://github.com/projnanda/nandatown},
   license = {Apache-2.0}
