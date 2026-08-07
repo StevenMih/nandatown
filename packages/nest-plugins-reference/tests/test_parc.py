@@ -28,7 +28,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib
 import json
+import sys
+import types
 from typing import Any
 
 import pytest
@@ -116,6 +119,77 @@ def _identities() -> tuple[Ed25519RotatingIdentity, Ed25519RotatingIdentity, str
     assert gate.apply_rotation(rotation)
     issuer.set_clock(_ISSUE_AT)
     return issuer, gate, old_key_id
+
+
+# ---------------------------------------------------------------------------
+# A minimal in-memory stand-in for the optional ``capsule_emit`` package.
+#
+# ``ParcTrust``'s anchoring is soft-dependent on the real package (never
+# installed in this repo — see ``aae_permit_gate.py``'s identical posture),
+# so these tests install a fake module under ``sys.modules["capsule_emit"]``
+# that mimics just the two entry points ``parc.py`` calls: ``emit()`` (returns
+# an object with ``.capsule_id`` / ``.capsule``) and ``verify_input_digest()``
+# (digest-only, matching the real package's "content stays local" contract —
+# the capsule stores a digest of ``agent_input``, never the plaintext).
+# ---------------------------------------------------------------------------
+
+
+def _fake_capsule_digest(value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+class _FakeEmitResult:
+    def __init__(self, capsule_id: str, capsule: dict[str, Any]) -> None:
+        self.capsule_id = capsule_id
+        self.capsule = capsule
+        self.anchored = True
+
+
+def _install_fake_capsule_emit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install a fake ``capsule_emit`` module for the duration of one test."""
+    counter = {"n": 0}
+
+    def _emit(
+        action: str,
+        operator: str = "",
+        developer: str = "",
+        *,
+        agent_input: Any = None,
+        agent_output: Any = None,
+        anchor: bool = True,
+        ledger: Any = "ledger.jsonl",
+        **_kwargs: Any,
+    ) -> _FakeEmitResult:
+        counter["n"] += 1
+        capsule_id = f"fake-capsule-{counter['n']}"
+        capsule = {
+            "capsule_id": capsule_id,
+            "action": action,
+            "model_attestation": {
+                "compute_attestation": {
+                    "agent_input_digest": (
+                        _fake_capsule_digest(agent_input) if agent_input is not None else None
+                    ),
+                },
+            },
+        }
+        return _FakeEmitResult(capsule_id, capsule)
+
+    def _verify_input_digest(capsule: dict[str, Any], candidate_input: Any) -> bool:
+        stored = (
+            capsule.get("model_attestation", {})
+            .get("compute_attestation", {})
+            .get("agent_input_digest")
+        )
+        if stored is None:
+            return False
+        return bool(stored == _fake_capsule_digest(candidate_input))
+
+    fake_module = types.ModuleType("capsule_emit")
+    fake_module.emit = _emit  # type: ignore[attr-defined]
+    fake_module.verify_input_digest = _verify_input_digest  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "capsule_emit", fake_module)
 
 
 def _policy(**overrides: Any) -> AdmissionPolicy:
@@ -770,3 +844,187 @@ class TestPresentation:
         pres1, _, _ = await _presentation()
         pres2, _, _ = await _presentation()
         assert json.dumps(pres1, sort_keys=True) == json.dumps(pres2, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
+# Root anchoring — sealing behavioral_merkle_root into a capsule, and the
+# verify_presentation check against it.
+# ---------------------------------------------------------------------------
+
+
+class TestAnchor:
+    @pytest.mark.asyncio
+    async def test_anchor_off_by_default_no_capsule(self) -> None:
+        # anchor=False (the default) never touches capsule_emit, installed
+        # or not — same opt-in posture as AAEPermitGate's anchor=False.
+        _vc, trust = await _alice_credential()
+        assert trust.anchored_capsule(_did("alice"), _ISSUE_AT) is None
+
+    @pytest.mark.asyncio
+    async def test_anchor_unavailable_degrades_to_noop(self) -> None:
+        # anchor=True but capsule_emit genuinely not installed in this repo's
+        # env (no fake module patched in this test): no crash, no capsule
+        # sealed — the credential itself is unaffected.
+        receipts = _alice_receipts()
+        trust = ParcTrust(anchor=True)
+        for r in receipts:
+            await trust.report(
+                AgentId("reporter"),
+                Evidence(
+                    reporter=AgentId("reporter"),
+                    subject=AgentId("reporter"),
+                    kind="positive",
+                    detail=json.dumps(r),
+                ),
+            )
+        issuer_ident, _, _ = _identities()
+        vc = await trust.build_credential(
+            AgentId("alice"), identity=issuer_ident, valid_from=_ISSUE_AT
+        )
+        assert trust.anchored_capsule(_did("alice"), _ISSUE_AT) is None
+        assert vc["credentialSubject"]["behavioral_merkle_root"] == merkle_root(receipts)
+
+    @pytest.mark.asyncio
+    async def test_root_sealed_into_capsule(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_fake_capsule_emit(monkeypatch)
+        receipts = _alice_receipts()
+        trust = ParcTrust(anchor=True)
+        for r in receipts:
+            await trust.report(
+                AgentId("reporter"),
+                Evidence(
+                    reporter=AgentId("reporter"),
+                    subject=AgentId("reporter"),
+                    kind="positive",
+                    detail=json.dumps(r),
+                ),
+            )
+        issuer_ident, _, _ = _identities()
+        vc = await trust.build_credential(
+            AgentId("alice"), identity=issuer_ident, valid_from=_ISSUE_AT
+        )
+        capsule = trust.anchored_capsule(_did("alice"), _ISSUE_AT)
+        assert capsule is not None
+        assert capsule["action"] == "parc.root_sealed"
+
+        capsule_emit = importlib.import_module("capsule_emit")  # the fake installed above
+
+        root = vc["credentialSubject"]["behavioral_merkle_root"]
+        count = vc["credentialSubject"]["receipt_count"]
+        assert capsule_emit.verify_input_digest(
+            capsule, {"behavioral_merkle_root": root, "receipt_count": count}
+        )
+        # A tampered candidate root does not match the sealed digest.
+        assert not capsule_emit.verify_input_digest(
+            capsule, {"behavioral_merkle_root": "0" * 64, "receipt_count": count}
+        )
+
+    @pytest.mark.asyncio
+    async def test_verify_presentation_accepts_matching_anchor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_fake_capsule_emit(monkeypatch)
+        receipts = _ledger(20)
+        trust = ParcTrust(anchor=True)
+        for r in receipts:
+            await trust.report(
+                AgentId("reporter"),
+                Evidence(
+                    reporter=AgentId("reporter"),
+                    subject=AgentId("reporter"),
+                    kind="positive",
+                    detail=json.dumps(r),
+                ),
+            )
+        issuer_ident, gate_ident, _ = _identities()
+        vc = await trust.build_credential(
+            AgentId("alice"), identity=issuer_ident, valid_from=_ISSUE_AT
+        )
+        capsule = trust.anchored_capsule(_did("alice"), _ISSUE_AT)
+        assert capsule is not None
+        pres = trust.build_presentation(vc, receipts, disclose=("r03", "r07"))
+
+        result = await trust.verify_presentation(pres, identity=gate_ident, anchor_capsule=capsule)
+        assert (result.ok, result.reasons) == (True, ())
+
+    @pytest.mark.asyncio
+    async def test_equivocation_after_anchor_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gap this feature closes: an issuer regenerates its receipt
+        tree (here: reports one more corroborated receipt) and re-exports a
+        different, still self-consistently-signed root for the SAME nominal
+        (issuer, subject, validFrom). Without the anchor, the equivocated
+        credential's presentation verifies clean. With the ORIGINAL sealed
+        root supplied as ``anchor_capsule``, it is caught.
+        """
+        _install_fake_capsule_emit(monkeypatch)
+        receipts = _alice_receipts()  # 2 receipts: r1, r2
+        trust = ParcTrust(anchor=True)
+        for r in receipts:
+            await trust.report(
+                AgentId("reporter"),
+                Evidence(
+                    reporter=AgentId("reporter"),
+                    subject=AgentId("reporter"),
+                    kind="positive",
+                    detail=json.dumps(r),
+                ),
+            )
+        issuer_ident, gate_ident, _ = _identities()
+        vc1 = await trust.build_credential(
+            AgentId("alice"), identity=issuer_ident, valid_from=_ISSUE_AT
+        )
+        original_capsule = trust.anchored_capsule(_did("alice"), _ISSUE_AT)
+        assert original_capsule is not None
+
+        # Equivocate: the issuer's own ledger grows a THIRD corroborated
+        # receipt for alice, and the issuer re-exports for the same
+        # (subject, validFrom) — a different, self-consistent root.
+        extra = _receipt("alice", "dave", rid="r3")
+        await trust.report(
+            AgentId("reporter"),
+            Evidence(
+                reporter=AgentId("reporter"),
+                subject=AgentId("reporter"),
+                kind="positive",
+                detail=json.dumps(extra),
+            ),
+        )
+        vc2 = await trust.build_credential(
+            AgentId("alice"), identity=issuer_ident, valid_from=_ISSUE_AT
+        )
+        assert (
+            vc2["credentialSubject"]["behavioral_merkle_root"]
+            != vc1["credentialSubject"]["behavioral_merkle_root"]
+        )
+
+        all_receipts = [*receipts, extra]
+        pres2 = trust.build_presentation(vc2, all_receipts, disclose=("r1",))
+
+        # THE GAP: without the anchor, the equivocated credential's
+        # presentation is entirely self-consistent and verifies clean.
+        unchecked = await trust.verify_presentation(pres2, identity=gate_ident)
+        assert (unchecked.ok, unchecked.reasons) == (True, ())
+
+        # THE CLOSE: the ORIGINAL anchored root catches the swap.
+        checked = await trust.verify_presentation(
+            pres2, identity=gate_ident, anchor_capsule=original_capsule
+        )
+        assert checked.ok is False
+        assert "anchor_mismatch" in checked.reasons
+
+    @pytest.mark.asyncio
+    async def test_anchor_capsule_without_package_fails_closed(self) -> None:
+        # anchor_capsule supplied, but capsule_emit is NOT installed (no fake
+        # module patched in this test): fails closed, distinctly from a
+        # digest mismatch.
+        pres, trust, _ = await _presentation()
+        _, gate_ident, _ = _identities()
+        result = await trust.verify_presentation(
+            pres,
+            identity=gate_ident,
+            anchor_capsule={"model_attestation": {}},
+        )
+        assert result.ok is False
+        assert "anchor_unavailable" in result.reasons

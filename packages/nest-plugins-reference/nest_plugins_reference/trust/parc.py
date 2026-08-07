@@ -36,6 +36,17 @@ gates, collusion-ring severance) with three new capabilities:
    every edge), so the signed score stands — recomputing it from a
    hand-picked subset is exactly the cherry-picking attack this split
    forbids. Full-ledger recomputation remains :meth:`ParcTrust.admit`'s job.
+4. **Root anchoring** — the issuer's signature alone only proves *an* issuer
+   signed *some* root; an issuer that regenerates its receipt tree can
+   produce a different, still self-consistently-signed root for the same
+   nominal credential, and the signature check alone never catches it. With
+   ``anchor=True``, :meth:`ParcTrust.build_credential` seals each credential's
+   ``behavioral_merkle_root`` and ``receipt_count`` into a capsule
+   (:meth:`ParcTrust._anchor_root`, the same optional,
+   soft-dependent-on-``capsule_emit`` posture as ``aae_permit_gate``'s
+   ``anchor``), and :meth:`ParcTrust.verify_presentation`'s
+   ``anchor_capsule`` option checks a presented root against that sealed
+   capsule, surfacing a regenerated-tree equivocation as ``anchor_mismatch``.
 
 An inline credential carries only the subject's own receipts — a star graph —
 so it cannot reveal an N-party collusion ring (each ring member's credential
@@ -78,6 +89,8 @@ Example::
 from __future__ import annotations
 
 import hashlib
+import importlib
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -91,6 +104,8 @@ from nest_core.types import AgentId
 # whole-graph collusion severance MUST stay in exactly one place so a
 # credential's recomputed score can never drift from the exporter's.
 from nest_plugins_reference.trust import agent_receipts as ar
+
+logger = logging.getLogger(__name__)
 
 SCORING_METHOD = "nanda-rep/0.2"
 CREDENTIAL_TYPE = "ParcReputationCredential"
@@ -423,8 +438,9 @@ class DisclosureResult:
     receipt checked out. ``reasons`` is empty on success, else the ordered,
     de-duplicated snake_case failures (``malformed_presentation``,
     ``issuer_mismatch``, ``bad_credential_proof``, ``malformed_proof``,
-    ``count_mismatch``, ``not_included``). Frozen — a verification verdict is
-    evidence, not a scratchpad.
+    ``count_mismatch``, ``not_included``, ``anchor_mismatch``,
+    ``anchor_unavailable``). Frozen — a verification verdict is evidence,
+    not a scratchpad.
 
     Example::
 
@@ -473,6 +489,36 @@ def _disclosed_entry_reasons(entry: Any, *, root: str, receipt_count: int) -> li
     return reasons
 
 
+def _anchor_reason(anchor_capsule: dict[str, Any], *, root: str, receipt_count: int) -> str | None:
+    """``None`` iff ``anchor_capsule`` was sealed for exactly this ``(root, receipt_count)``.
+
+    Uses ``capsule_emit.verify_input_digest`` against the same
+    ``{"behavioral_merkle_root", "receipt_count"}`` shape
+    :meth:`ParcTrust._anchor_root` sealed as the capsule's digest-committed
+    ``agent_input`` — the capsule never stores the plaintext root (digest-only
+    commitment), so this recomputes the digest and compares rather than
+    reading a stored value back out. ``"anchor_unavailable"`` when
+    ``capsule_emit`` cannot be imported — a capsule cannot be interpreted
+    without the package that produced it, so this fails closed rather than
+    silently skipping the check. ``"anchor_mismatch"`` when the digest
+    disagrees: the credential's presented root was not the one this capsule
+    sealed — the regenerated-tree equivocation case this check exists to
+    catch.
+
+    Example::
+
+        reason = _anchor_reason(capsule, root=root, receipt_count=2)
+    """
+    try:
+        capsule_emit = importlib.import_module("capsule_emit")
+    except ImportError:
+        return "anchor_unavailable"
+    candidate = {"behavioral_merkle_root": root, "receipt_count": receipt_count}
+    if not capsule_emit.verify_input_digest(anchor_capsule, candidate):
+        return "anchor_mismatch"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # The trust plugin
 # ---------------------------------------------------------------------------
@@ -491,13 +537,33 @@ class ParcTrust(ar.AgentReceiptsTrust):
 
         trust = ParcTrust()
         vc = await trust.build_credential(subject, identity=ident, valid_from=6.0)
+
+    ``anchor=True`` opts into sealing each built credential's
+    ``behavioral_merkle_root`` into a capsule (:meth:`_anchor_root`), the
+    same optional, soft-dependent-on-``capsule_emit`` posture as
+    ``AAEPermitGate``'s ``anchor`` — never a hard requirement.
     """
 
-    def __init__(self, identity: Any = None) -> None:
+    def __init__(
+        self,
+        identity: Any = None,
+        *,
+        anchor: bool = False,
+        ledger: str = "capsule_ledger.jsonl",
+    ) -> None:
         super().__init__(identity)
         # The originating domain's community ledger, if one was published to
         # this gate. Whole-graph severance for admissions runs over this.
         self._published_ledger: list[dict[str, Any]] = []
+        self._anchor = anchor
+        # Deliberately NOT named ``_ledger`` — the base class already owns
+        # that name for the receipt ledger (``AgentReceiptsTrust._ledger``);
+        # this is the on-disk path capsule_emit appends its JSONL to.
+        self._capsule_ledger = ledger
+        self._anchor_unavailable_logged = False
+        # (subject_did, valid_from) -> the capsule this instance sealed for
+        # that credential's root, if anchoring is on and available.
+        self._anchor_capsules: dict[tuple[str, float], dict[str, Any]] = {}
 
     # -- export ------------------------------------------------------------
 
@@ -549,7 +615,71 @@ class ParcTrust(ar.AgentReceiptsTrust):
                 "receipts": receipts,
             },
         }
-        return attach_proof(credential, identity=identity, key_id=key_id)
+        credential = attach_proof(credential, identity=identity, key_id=key_id)
+        self._anchor_root(
+            did=did,
+            valid_from=valid_from,
+            root=str(credential["credentialSubject"]["behavioral_merkle_root"]),
+            receipt_count=len(receipts),
+            issuer=str(credential["issuer"]),
+        )
+        return credential
+
+    def _anchor_root(
+        self, *, did: str, valid_from: float, root: str, receipt_count: int, issuer: str
+    ) -> None:
+        """Optionally seal ``(behavioral_merkle_root, receipt_count)`` into a capsule.
+
+        Mirrors ``AAEPermitGate._anchor_envelope``: opt-in (``anchor=True``
+        at construction) and soft-dependent on the optional ``capsule_emit``
+        package — absent, this degrades to a one-time debug log and a no-op,
+        never a hard dependency. Namespaced ``"parc.root_sealed"`` so a
+        sealed root never reads as an executed action. The capsule is a
+        second, independent witness of the root the issuer already signed —
+        it does not replace that signature, it gives
+        :meth:`verify_presentation`'s ``anchor_capsule`` option something
+        outside the issuer's own proof to check a presented root against.
+
+        Example::
+
+            trust._anchor_root(did=did, valid_from=6.0, root=root,
+                               receipt_count=2, issuer="did:nest:issuer-a")
+        """
+        if not self._anchor:
+            return
+        try:
+            capsule_emit = importlib.import_module("capsule_emit")
+        except ImportError:
+            if not self._anchor_unavailable_logged:
+                logger.debug("anchor=True but capsule_emit is not installed; anchoring disabled")
+                self._anchor_unavailable_logged = True
+            return
+        result = capsule_emit.emit(
+            action="parc.root_sealed",
+            operator=did,
+            developer=str(self._SYSTEM_AGENT),
+            agent_input={"behavioral_merkle_root": root, "receipt_count": receipt_count},
+            agent_output={"issuer": issuer, "valid_from": valid_from},
+            anchor=True,
+            ledger=self._capsule_ledger,
+        )
+        self._anchor_capsules[(did, valid_from)] = result.capsule
+
+    def anchored_capsule(self, subject_did: str, valid_from: float) -> dict[str, Any] | None:
+        """The capsule this instance sealed for ``(subject_did, valid_from)``, if any.
+
+        ``None`` when anchoring is off, ``capsule_emit`` was unavailable at
+        build time, or no credential has been built for that key yet. A real
+        deployment fetches the equivalent capsule from the transparency
+        ledger by capsule id; same-process tests and demos read it straight
+        from here and pass it to :meth:`verify_presentation`'s
+        ``anchor_capsule`` option.
+
+        Example::
+
+            capsule = trust.anchored_capsule(did, 6.0)
+        """
+        return self._anchor_capsules.get((subject_did, valid_from))
 
     # -- published-ledger ingestion -----------------------------------------
 
@@ -779,6 +909,7 @@ class ParcTrust(ar.AgentReceiptsTrust):
         *,
         identity: Any,
         expected_issuer: str | None = None,
+        anchor_capsule: dict[str, Any] | None = None,
     ) -> DisclosureResult:
         """Verify a selective-disclosure presentation; no score is recomputed.
 
@@ -796,6 +927,19 @@ class ParcTrust(ar.AgentReceiptsTrust):
         remainder (``count_mismatch``) — and the receipt folds to the signed
         ``behavioral_merkle_root`` (``not_included``).
 
+        ``anchor_capsule``, when supplied, is checked against the presented
+        ``(behavioral_merkle_root, receipt_count)`` (``_anchor_reason``): a
+        signature alone only proves the issuer signed *some* root for this
+        subject — an issuer that regenerates its receipt tree can produce a
+        different, still self-consistently-signed root for the same nominal
+        credential, and nothing in the proof check catches that. A capsule
+        sealed for the credential's ORIGINAL root at issuance (see
+        :meth:`_anchor_root` / :meth:`anchored_capsule`) gives this check
+        something outside the issuer's own signature to compare against, so
+        that equivocation surfaces as ``anchor_mismatch`` instead of passing
+        silently. Omitting ``anchor_capsule`` (the default) skips this check
+        entirely — same opt-in posture as ``anchor=True`` at construction.
+
         Deliberately absent: score recomputation. Disclosure proves *which
         receipts happened* under the signed commitment; the reputation
         aggregate is a whole-graph property, so the signed score stands and a
@@ -804,7 +948,8 @@ class ParcTrust(ar.AgentReceiptsTrust):
 
         Example::
 
-            result = await gate.verify_presentation(pres, identity=gate_ident)
+            result = await gate.verify_presentation(pres, identity=gate_ident,
+                                                     anchor_capsule=capsule)
         """
         credential = presentation.get("credential")
         disclosed = presentation.get("disclosed")
@@ -835,6 +980,10 @@ class ParcTrust(ar.AgentReceiptsTrust):
             for reason in _disclosed_entry_reasons(entry, root=root, receipt_count=receipt_count):
                 if reason not in reasons:
                     reasons.append(reason)
+        if anchor_capsule is not None:
+            anchor_fail = _anchor_reason(anchor_capsule, root=root, receipt_count=receipt_count)
+            if anchor_fail is not None and anchor_fail not in reasons:
+                reasons.append(anchor_fail)
         if reasons:
             return DisclosureResult(False, tuple(reasons))
         return DisclosureResult(True)

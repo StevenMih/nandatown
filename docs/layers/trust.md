@@ -92,6 +92,20 @@ edge), so the signed score stands — re-deriving it from a hand-picked
 subset is exactly the cherry-picking this split forbids. Full-ledger
 recomputation remains `admit`'s job.
 
+**Root anchoring.** The issuer's signature only proves *an* issuer
+signed *some* root — an issuer that regenerates its receipt tree (drops
+a receipt, adds a fabricated one) can produce a different, still
+self-consistently-signed root for the same nominal credential, and
+nothing in the proof check alone catches it. With `anchor=True`,
+`build_credential` seals each credential's `behavioral_merkle_root` and
+`receipt_count` into a capsule — same opt-in, soft-dependent-on-
+`capsule-emit` posture as `aae_permit_gate`'s `anchor` (below): absent
+the package, anchoring degrades to a one-time debug log and a no-op,
+never a hard dependency. `verify_presentation`'s `anchor_capsule` option
+then checks a presented root against that sealed capsule, so a
+regenerated-tree equivocation surfaces as `anchor_mismatch` instead of
+verifying clean.
+
 Source: [`nest_plugins_reference/trust/parc.py`](../../packages/nest-plugins-reference/nest_plugins_reference/trust/parc.py).
 Scenario: `parc_migration` (two trust domains in one run; forged,
 replayed, stale-key, inflated, and wash-ring credentials each denied
